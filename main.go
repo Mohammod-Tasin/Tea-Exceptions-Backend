@@ -233,23 +233,48 @@ func (srv *server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// flexibleID unmarshals a command id given as either a JSON number or a
+// numeric string, since callers report it back after receiving it as a number.
+type flexibleID int64
+
+func (id *flexibleID) UnmarshalJSON(data []byte) error {
+	var n int64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*id = flexibleID(n)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return fmt.Errorf("id must be a number or numeric string")
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("id must be a number or numeric string")
+	}
+	*id = flexibleID(n)
+	return nil
+}
+
 func (srv *server) handleDeviceConsumed(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ID    string `json:"id"`
-		Drink string `json:"drink"`
+		ID    flexibleID `json:"id"`
+		Drink string     `json:"drink"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !validDrinks[body.Drink] {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		reason := fmt.Sprintf("invalid request: %v", err)
+		srv.logger.Info("device consumed", "result", "rejected", "reason", reason)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": reason})
 		return
 	}
-	cmdID, err := strconv.ParseInt(body.ID, 10, 64)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid id"})
+	if !validDrinks[body.Drink] {
+		reason := fmt.Sprintf("invalid request: drink must be one of coffee, tea, hotwater, got %q", body.Drink)
+		srv.logger.Info("device consumed", "result", "rejected", "reason", reason)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": reason})
 		return
 	}
 
-	ended := srv.state.consumed(time.Now(), cmdID, body.Drink)
-	srv.logger.Info("device consumed", "id", body.ID, "drink", body.Drink, "ended", ended)
+	ended := srv.state.consumed(time.Now(), int64(body.ID), body.Drink)
+	srv.logger.Info("device consumed", "id", int64(body.ID), "drink", body.Drink, "ended", ended)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
