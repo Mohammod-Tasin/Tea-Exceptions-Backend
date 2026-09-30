@@ -36,6 +36,9 @@ curl "http://localhost:8080/api/device/poll?wait=25"
 curl -X POST http://localhost:8080/api/unlock -d '{"drink":"tea"}'
 
 curl http://localhost:8080/api/status
+
+# device reports early consumption (ends the busy window immediately):
+curl -X POST http://localhost:8080/api/device/consumed -d '{"id":"1","drink":"coffee"}'
 ```
 
 ## 2. Run locally with Docker

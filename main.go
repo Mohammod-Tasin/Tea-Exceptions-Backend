@@ -1,6 +1,3 @@
-// Command teamachine is the backend for a coffee machine unlock system.
-// A website calls POST /api/unlock to queue a drink command; an ESP32
-// long-polls GET /api/device/poll to receive it.
 package main
 
 import (
@@ -32,6 +29,7 @@ type machineState struct {
 	lastSeen  time.Time
 	busyUntil time.Time
 	busyDrink string
+	busyID    int64
 
 	online  bool
 	waiters []chan command
@@ -100,6 +98,7 @@ func (s *machineState) unlock(now time.Time, drink string, seconds int) (errCode
 		s.waiters = s.waiters[1:]
 		s.busyUntil = now.Add(time.Duration(seconds) * time.Second)
 		s.busyDrink = drink
+		s.busyID = cmd.ID
 		ch <- cmd
 	} else {
 		s.pending = &cmd
@@ -121,12 +120,30 @@ func (s *machineState) poll(now time.Time) (cmd *command, wait chan command) {
 		s.pending = nil
 		s.busyUntil = now.Add(time.Duration(c.Seconds) * time.Second)
 		s.busyDrink = c.Drink
+		s.busyID = c.ID
 		return &c, nil
 	}
 
 	ch := make(chan command, 1)
 	s.waiters = append(s.waiters, ch)
 	return nil, ch
+}
+
+// consumed ends the busy window early if id+drink match the active command
+// (pending or in-progress). Idempotent: a stale/unknown id is a no-op.
+func (s *machineState) consumed(now time.Time, id int64, drink string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.pending != nil && s.pending.ID == id && s.pending.Drink == drink {
+		s.pending = nil
+		return true
+	}
+	if s.busyID == id && s.busyDrink == drink && now.Before(s.busyUntil) {
+		s.busyUntil = now
+		return true
+	}
+	return false
 }
 
 func (s *machineState) removeWaiter(ch chan command) {
@@ -216,6 +233,26 @@ func (srv *server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (srv *server) handleDeviceConsumed(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID    string `json:"id"`
+		Drink string `json:"drink"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !validDrinks[body.Drink] {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid request"})
+		return
+	}
+	cmdID, err := strconv.ParseInt(body.ID, 10, 64)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid id"})
+		return
+	}
+
+	ended := srv.state.consumed(time.Now(), cmdID, body.Drink)
+	srv.logger.Info("device consumed", "id", body.ID, "drink", body.Drink, "ended", ended)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -294,6 +331,7 @@ func main() {
 	mux.HandleFunc("GET /api/status", srv.handleStatus)
 	mux.HandleFunc("POST /api/unlock", srv.handleUnlock)
 	mux.HandleFunc("GET /api/device/poll", srv.handleDevicePoll)
+	mux.HandleFunc("POST /api/device/consumed", srv.handleDeviceConsumed)
 
 	var handler http.Handler = mux
 	handler = corsMiddleware(frontendOrigin, handler)
