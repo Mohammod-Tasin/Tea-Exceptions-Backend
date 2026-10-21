@@ -6,7 +6,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +35,68 @@ type machineState struct {
 
 	online  bool
 	waiters []chan command
+
+	devState string // last reported by /api/device/status
+	devVolts float64
+	devAt    time.Time
+}
+
+var validMachineStates = map[string]bool{"ready": true, "heating": true, "sensor_fault": true}
+
+var (
+	statusStale = 30 * time.Second
+	tempTable   []tempPoint
+)
+
+type tempPoint struct{ volts, celsius float64 }
+
+// parseTempTable parses "volts:celsius,volts:celsius" into points sorted by volts.
+func parseTempTable(s string) ([]tempPoint, error) {
+	var pts []tempPoint
+	for _, pair := range strings.Split(s, ",") {
+		v, c, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		if !ok {
+			return nil, fmt.Errorf("bad pair %q", pair)
+		}
+		fv, err1 := strconv.ParseFloat(v, 64)
+		fc, err2 := strconv.ParseFloat(c, 64)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("bad pair %q", pair)
+		}
+		pts = append(pts, tempPoint{fv, fc})
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].volts < pts[j].volts })
+	return pts, nil
+}
+
+// tempFor interpolates the table; below/above are set when volts is outside it.
+func tempFor(volts float64) (c float64, below, above bool) {
+	t := tempTable
+	if volts < t[0].volts {
+		return t[0].celsius, true, false
+	}
+	if volts > t[len(t)-1].volts {
+		return t[len(t)-1].celsius, false, true
+	}
+	for i := 1; i < len(t); i++ {
+		if volts <= t[i].volts {
+			a, b := t[i-1], t[i]
+			if b.volts == a.volts {
+				return b.celsius, false, false
+			}
+			return a.celsius + (b.celsius-a.celsius)*(volts-a.volts)/(b.volts-a.volts), false, false
+		}
+	}
+	return t[len(t)-1].celsius, false, false
+}
+
+// machineStateLocked returns the effective heating state: "unknown" when no
+// status was received recently.
+func (s *machineState) machineStateLocked(now time.Time) string {
+	if s.devState == "" || now.Sub(s.devAt) > statusStale {
+		return "unknown"
+	}
+	return s.devState
 }
 
 func (s *machineState) isOnlineLocked(now time.Time) bool {
@@ -85,6 +149,9 @@ func (s *machineState) unlock(now time.Time, drink string, seconds int) (errCode
 
 	if !s.isOnlineLocked(now) {
 		return "offline", command{}
+	}
+	if s.machineStateLocked(now) != "ready" {
+		return "not_ready", command{}
 	}
 	if s.pending != nil || now.Before(s.busyUntil) {
 		return "busy", command{}
@@ -168,13 +235,66 @@ func (srv *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	online, busy, drink, secondsLeft := srv.state.status(time.Now())
+	now := time.Now()
+	online, busy, drink, secondsLeft := srv.state.status(now)
+	srv.state.mu.Lock()
+	ms := srv.state.machineStateLocked(now)
+	volts := srv.state.devVolts
+	srv.state.mu.Unlock()
+	var thsVolts, tempC any
+	var below, above bool
+	if ms != "unknown" {
+		thsVolts = volts
+		var c float64
+		c, below, above = tempFor(volts)
+		tempC = c
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"online":      online,
-		"busy":        busy,
-		"drink":       drink,
-		"secondsLeft": secondsLeft,
+		"online":       online,
+		"busy":         busy,
+		"drink":        drink,
+		"secondsLeft":  secondsLeft,
+		"machineState": ms,
+		"thsVolts":     thsVolts,
+		"tempC":        tempC,
+		"tempBelow":    below,
+		"tempAbove":    above,
 	})
+}
+
+func (srv *server) handleDeviceStatus(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ThsVolts float64 `json:"thsVolts"`
+		State    string  `json:"state"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !validMachineStates[body.State] || body.ThsVolts < 0 || body.ThsVolts > 6 {
+		srv.logger.Info("device status", "result", "bad_request", "state", body.State, "thsVolts", body.ThsVolts)
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "need state ready|heating|sensor_fault and thsVolts 0..6"})
+		return
+	}
+	now := time.Now()
+	srv.state.mu.Lock()
+	srv.state.devState, srv.state.devVolts, srv.state.devAt = body.State, body.ThsVolts, now
+	srv.state.lastSeen = now
+	srv.state.online = true
+	srv.state.mu.Unlock()
+	srv.logger.Info("device status", "state", body.State, "thsVolts", body.ThsVolts)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (srv *server) handleDeviceRejected(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID     flexibleID `json:"id"`
+		Drink  string     `json:"drink"`
+		Reason string     `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("invalid request: %v", err)})
+		return
+	}
+	cleared := srv.state.consumed(time.Now(), int64(body.ID), body.Drink)
+	srv.logger.Info("device rejected", "id", int64(body.ID), "drink", body.Drink, "reason", body.Reason, "cleared", cleared)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (srv *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +313,12 @@ func (srv *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
 	case "offline":
 		srv.logger.Info("unlock request", "drink", body.Drink, "result", "offline")
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "machine offline"})
+	case "not_ready":
+		srv.state.mu.Lock()
+		ms := srv.state.machineStateLocked(time.Now())
+		srv.state.mu.Unlock()
+		srv.logger.Info("unlock request", "drink", body.Drink, "result", "not_ready", "machineState", ms)
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_ready", "machineState": ms})
 	case "busy":
 		srv.logger.Info("unlock request", "drink", body.Drink, "result", "busy")
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "machine busy"})
@@ -347,6 +473,18 @@ func main() {
 		unlockSeconds = 25
 	}
 
+	if n, err := strconv.Atoi(getEnv("STATUS_STALE_SECONDS", "30")); err == nil && n > 0 {
+		statusStale = time.Duration(n) * time.Second
+	} else {
+		logger.Error("invalid STATUS_STALE_SECONDS, using default 30")
+	}
+	tempTable, err = parseTempTable(getEnv("TEMP_TABLE", "4.10:78,4.50:88,4.53:89"))
+	if err != nil {
+		logger.Error("invalid TEMP_TABLE, using default", "error", err)
+		tempTable, _ = parseTempTable("4.10:78,4.50:88,4.53:89")
+	}
+	logger.Info("temp table", "points", tempTable, "status_stale", statusStale.String())
+
 	state := &machineState{}
 	srv := &server{state: state, logger: logger}
 	go state.monitorOnline(logger)
@@ -357,6 +495,8 @@ func main() {
 	mux.HandleFunc("POST /api/unlock", srv.handleUnlock)
 	mux.HandleFunc("GET /api/device/poll", srv.handleDevicePoll)
 	mux.HandleFunc("POST /api/device/consumed", srv.handleDeviceConsumed)
+	mux.HandleFunc("POST /api/device/status", srv.handleDeviceStatus)
+	mux.HandleFunc("POST /api/device/rejected", srv.handleDeviceRejected)
 
 	var handler http.Handler = mux
 	handler = corsMiddleware(frontendOrigin, handler)
