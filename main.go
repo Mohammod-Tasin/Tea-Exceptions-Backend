@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -450,6 +451,19 @@ func corsMiddleware(origin string, next http.Handler) http.Handler {
 	})
 }
 
+// deviceAuthMiddleware requires the X-Device-Key header on /api/device/* when key is set.
+func deviceAuthMiddleware(logger *slog.Logger, key string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if key != "" && strings.HasPrefix(r.URL.Path, "/api/device/") &&
+			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Device-Key")), []byte(key)) != 1 {
+			logger.Info("device auth failed", "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 var unlockSeconds int
 
 func getEnv(key, def string) string {
@@ -465,6 +479,10 @@ func main() {
 	port := getEnv("PORT", "8080")
 	unlockSecondsStr := getEnv("UNLOCK_SECONDS", "25")
 	frontendOrigin := getEnv("FRONTEND_ORIGIN", "*")
+	deviceKey := os.Getenv("DEVICE_KEY")
+	if deviceKey == "" {
+		logger.Warn("DEVICE_KEY not set; device endpoints are unauthenticated")
+	}
 
 	var err error
 	unlockSeconds, err = strconv.Atoi(unlockSecondsStr)
@@ -498,7 +516,7 @@ func main() {
 	mux.HandleFunc("POST /api/device/status", srv.handleDeviceStatus)
 	mux.HandleFunc("POST /api/device/rejected", srv.handleDeviceRejected)
 
-	var handler http.Handler = mux
+	var handler http.Handler = deviceAuthMiddleware(logger, deviceKey, mux)
 	handler = corsMiddleware(frontendOrigin, handler)
 	handler = loggingMiddleware(logger, handler)
 

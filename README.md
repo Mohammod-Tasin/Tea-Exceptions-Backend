@@ -11,6 +11,7 @@ Stdlib only, single in-memory machine, no persistence.
 - `PORT` (default `8080`)
 - `UNLOCK_SECONDS` (default `25`) - how long the machine stays busy after a command
 - `FRONTEND_ORIGIN` (default `*`) - CORS allow-origin
+- `DEVICE_KEY` (default empty) - if set, ESP32 must send header `X-Device-Key` on /api/device/*.
 - `STATUS_STALE_SECONDS` (default `30`) - device status older than this makes `machineState` `unknown`
 - `TEMP_TABLE` (default `4.10:78,4.50:88,4.53:89`) - `volts:celsius` pairs, linearly interpolated for `tempC`
 
