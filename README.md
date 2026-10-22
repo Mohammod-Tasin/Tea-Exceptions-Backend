@@ -63,22 +63,6 @@ Watch logs:
 docker compose logs -f
 ```
 
-## 3. Deploy on Render
+## 3. Deploy (VPS, automatic)
 
-1. Create a new Web Service, connect this repo.
-2. Set "Root Directory" to this folder. Render auto-detects the Dockerfile
-   (runtime: Docker) - no build or start command needed.
-3. Set env vars: `UNLOCK_SECONDS`, `FRONTEND_ORIGIN`.
-4. Health check path: `/healthz`.
-
-`PORT` is supplied by Render automatically - do not set it manually.
-
-## 4. Later: VPS deploy (reference only)
-
-Same Dockerfile:
-
-```
-docker compose up -d --build
-```
-
-Put a reverse proxy (Caddy or nginx) in front for TLS.
+Every push to `main` triggers `.github/workflows/deploy.yml`, which SSHes into the VPS with a restricted key that can only run `/opt/teamachine/deploy.sh backend` (git reset to origin/main + `docker compose up -d --build tea-api`). Live at https://api.cafe.zerotouch.com.co. Required repo secrets: VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_KNOWN_HOSTS. Never edit code directly on the VPS.
