@@ -1,12 +1,10 @@
 package main
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,7 +12,10 @@ import (
 	"time"
 )
 
-const onlineThreshold = 60 * time.Second
+const (
+	onlineThreshold = 60 * time.Second
+	stalePending    = 30 * time.Second
+)
 
 var validDrinks = map[string]bool{"coffee": true, "tea": true, "hotwater": true}
 
@@ -28,7 +29,8 @@ type machineState struct {
 	mu sync.Mutex
 
 	pending   *command
-	nextID    int64
+	reserved  bool      // machine held while a purchase is being charged
+	pendingAt time.Time // when pending was queued
 	lastSeen  time.Time
 	busyUntil time.Time
 	busyDrink string
@@ -142,24 +144,38 @@ func (s *machineState) status(now time.Time) (online, busy bool, drink string, s
 	return
 }
 
-// unlock queues a command for the device. Returns ("", cmd) on success, or
-// (errCode, zero) on failure. errCode is one of "offline", "busy".
-func (s *machineState) unlock(now time.Time, drink string, seconds int) (errCode string, cmd command) {
+// reserve checks the machine can take a drink and holds it so concurrent
+// requests see "busy" while the caller charges the user. Returns "" on success,
+// else "offline", "not_ready" or "busy". Pair with queue or release.
+func (s *machineState) reserve(now time.Time) (errCode string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if !s.isOnlineLocked(now) {
-		return "offline", command{}
+		return "offline"
 	}
 	if s.machineStateLocked(now) != "ready" {
-		return "not_ready", command{}
+		return "not_ready"
 	}
-	if s.pending != nil || now.Before(s.busyUntil) {
-		return "busy", command{}
+	if s.reserved || s.pending != nil || now.Before(s.busyUntil) {
+		return "busy"
 	}
+	s.reserved = true
+	return ""
+}
 
-	s.nextID++
-	cmd = command{ID: s.nextID, Drink: drink, Seconds: seconds}
+func (s *machineState) release() {
+	s.mu.Lock()
+	s.reserved = false
+	s.mu.Unlock()
+}
+
+// queue hands a command to the device and clears the reservation.
+func (s *machineState) queue(now time.Time, cmd command) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reserved = false
+	seconds, drink := cmd.Seconds, cmd.Drink
 
 	if len(s.waiters) > 0 {
 		ch := s.waiters[0]
@@ -170,8 +186,8 @@ func (s *machineState) unlock(now time.Time, drink string, seconds int) (errCode
 		ch <- cmd
 	} else {
 		s.pending = &cmd
+		s.pendingAt = now
 	}
-	return "", cmd
 }
 
 // poll registers the device as seen and either returns a ready command
@@ -183,6 +199,11 @@ func (s *machineState) poll(now time.Time) (cmd *command, wait chan command) {
 	s.lastSeen = now
 	s.online = true
 
+	// A command nobody collected for a while is dropped; its order is refunded
+	// by the sweeper.
+	if s.pending != nil && now.Sub(s.pendingAt) > stalePending {
+		s.pending = nil
+	}
 	if s.pending != nil {
 		c := *s.pending
 		s.pending = nil
@@ -223,11 +244,6 @@ func (s *machineState) removeWaiter(ch chan command) {
 			break
 		}
 	}
-}
-
-type server struct {
-	state  *machineState
-	logger *slog.Logger
 }
 
 func (srv *server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -294,39 +310,16 @@ func (srv *server) handleDeviceRejected(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	cleared := srv.state.consumed(time.Now(), int64(body.ID), body.Drink)
-	srv.logger.Info("device rejected", "id", int64(body.ID), "drink", body.Drink, "reason", body.Reason, "cleared", cleared)
+	reason := strings.TrimSpace(body.Reason)
+	if reason == "" {
+		reason = "rejected"
+	}
+	refunded, err := srv.refundOrder(r.Context(), int64(body.ID), reason)
+	if err != nil {
+		srv.logger.Error("refund failed", "order", int64(body.ID), "error", err)
+	}
+	srv.logger.Info("device rejected", "id", int64(body.ID), "drink", body.Drink, "reason", body.Reason, "cleared", cleared, "refunded", refunded)
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (srv *server) handleUnlock(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Drink string `json:"drink"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !validDrinks[body.Drink] {
-		srv.logger.Info("unlock request", "drink", body.Drink, "result", "bad_request")
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid drink"})
-		return
-	}
-
-	seconds := unlockSeconds
-	errCode, cmd := srv.state.unlock(time.Now(), body.Drink, seconds)
-	switch errCode {
-	case "offline":
-		srv.logger.Info("unlock request", "drink", body.Drink, "result", "offline")
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "machine offline"})
-	case "not_ready":
-		srv.state.mu.Lock()
-		ms := srv.state.machineStateLocked(time.Now())
-		srv.state.mu.Unlock()
-		srv.logger.Info("unlock request", "drink", body.Drink, "result", "not_ready", "machineState", ms)
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "not_ready", "machineState": ms})
-	case "busy":
-		srv.logger.Info("unlock request", "drink", body.Drink, "result", "busy")
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "machine busy"})
-	default:
-		srv.logger.Info("unlock request", "drink", body.Drink, "result", "ok")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "drink": cmd.Drink, "seconds": cmd.Seconds})
-	}
 }
 
 func (srv *server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
@@ -340,6 +333,7 @@ func (srv *server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
 	cmd, ch := srv.state.poll(time.Now())
 	if cmd != nil {
 		srv.logger.Info("device poll", "result", "command", "drink", cmd.Drink)
+		srv.armTimeout(*cmd)
 		writeJSON(w, http.StatusOK, cmd)
 		return
 	}
@@ -350,6 +344,7 @@ func (srv *server) handleDevicePoll(w http.ResponseWriter, r *http.Request) {
 	select {
 	case c := <-ch:
 		srv.logger.Info("device poll", "result", "command", "drink", c.Drink)
+		srv.armTimeout(c)
 		writeJSON(w, http.StatusOK, c)
 	case <-timer.C:
 		srv.state.removeWaiter(ch)
@@ -401,134 +396,11 @@ func (srv *server) handleDeviceConsumed(w http.ResponseWriter, r *http.Request) 
 	}
 
 	ended := srv.state.consumed(time.Now(), int64(body.ID), body.Drink)
+	if _, err := srv.completeOrder(r.Context(), int64(body.ID)); err != nil {
+		srv.logger.Error("complete order failed", "order", int64(body.ID), "error", err)
+	}
 	srv.logger.Info("device consumed", "id", int64(body.ID), "drink", body.Drink, "ended", ended)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
-// loggingMiddleware logs every request: method, path, status, duration, remote addr.
-func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(sw, r)
-		logger.Info("request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"status", sw.status,
-			"duration_ms", time.Since(start).Milliseconds(),
-			"remote_addr", r.RemoteAddr,
-		)
-	})
-}
-
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (sw *statusWriter) WriteHeader(status int) {
-	sw.status = status
-	sw.ResponseWriter.WriteHeader(status)
-}
-
-// corsMiddleware allows the configured frontend origin and handles preflight.
-func corsMiddleware(origin string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// deviceAuthMiddleware requires the X-Device-Key header on /api/device/* when key is set.
-func deviceAuthMiddleware(logger *slog.Logger, key string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if key != "" && strings.HasPrefix(r.URL.Path, "/api/device/") &&
-			subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Device-Key")), []byte(key)) != 1 {
-			logger.Info("device auth failed", "path", r.URL.Path, "remote_addr", r.RemoteAddr)
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 var unlockSeconds int
-
-func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-
-	port := getEnv("PORT", "8080")
-	unlockSecondsStr := getEnv("UNLOCK_SECONDS", "25")
-	frontendOrigin := getEnv("FRONTEND_ORIGIN", "*")
-	deviceKey := os.Getenv("DEVICE_KEY")
-	if deviceKey == "" {
-		logger.Warn("DEVICE_KEY not set; device endpoints are unauthenticated")
-	}
-
-	var err error
-	unlockSeconds, err = strconv.Atoi(unlockSecondsStr)
-	if err != nil || unlockSeconds <= 0 {
-		logger.Error("invalid UNLOCK_SECONDS, using default", "value", unlockSecondsStr)
-		unlockSeconds = 25
-	}
-
-	if n, err := strconv.Atoi(getEnv("STATUS_STALE_SECONDS", "30")); err == nil && n > 0 {
-		statusStale = time.Duration(n) * time.Second
-	} else {
-		logger.Error("invalid STATUS_STALE_SECONDS, using default 30")
-	}
-	tempTable, err = parseTempTable(getEnv("TEMP_TABLE", "4.10:78,4.50:88,4.53:89"))
-	if err != nil {
-		logger.Error("invalid TEMP_TABLE, using default", "error", err)
-		tempTable, _ = parseTempTable("4.10:78,4.50:88,4.53:89")
-	}
-	logger.Info("temp table", "points", tempTable, "status_stale", statusStale.String())
-
-	state := &machineState{}
-	srv := &server{state: state, logger: logger}
-	go state.monitorOnline(logger)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", srv.handleHealthz)
-	mux.HandleFunc("GET /api/status", srv.handleStatus)
-	mux.HandleFunc("POST /api/unlock", srv.handleUnlock)
-	mux.HandleFunc("GET /api/device/poll", srv.handleDevicePoll)
-	mux.HandleFunc("POST /api/device/consumed", srv.handleDeviceConsumed)
-	mux.HandleFunc("POST /api/device/status", srv.handleDeviceStatus)
-	mux.HandleFunc("POST /api/device/rejected", srv.handleDeviceRejected)
-
-	var handler http.Handler = deviceAuthMiddleware(logger, deviceKey, mux)
-	handler = corsMiddleware(frontendOrigin, handler)
-	handler = loggingMiddleware(logger, handler)
-
-	logger.Info("server starting",
-		"port", port,
-		"unlock_seconds", unlockSeconds,
-		"frontend_origin", frontendOrigin,
-	)
-
-	addr := fmt.Sprintf(":%s", port)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		logger.Error("server failed", "error", err)
-		os.Exit(1)
-	}
-}
